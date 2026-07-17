@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>machin-feedback — an agent-first feedback relay</title>
+<meta name="description" content="One inbox for every app's feedback command. Agents send bugs, ideas, praise; you browse it all cross-app. One static machin binary.">
+<style>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:#0e1216;color:#e8edf2;font:16px/1.65 system-ui,-apple-system,"Segoe UI",sans-serif}
+a{color:#3ad0c4;text-decoration:none}a:hover{text-decoration:underline}
+.wrap{max-width:760px;margin:0 auto;padding:72px 24px 96px}
+.eyebrow{font:12px ui-monospace,monospace;letter-spacing:.24em;text-transform:uppercase;color:#3ad0c4;margin:0 0 14px}
+h1{font-size:40px;line-height:1.1;letter-spacing:-.025em;margin:0 0 14px}
+h1 .g{background:linear-gradient(90deg,#86efac,#3ad0c4);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.lede{font-size:19px;color:#b4bcc8;margin:0 0 30px}
+.cta{display:flex;gap:12px;flex-wrap:wrap;margin:0 0 44px}
+.btn{display:inline-block;padding:11px 20px;border-radius:10px;font-weight:600;font-size:15px}
+.btn.primary{background:#3ad0c4;color:#062023}
+.btn.ghost{border:1px solid #232c34;color:#e8edf2}
+pre{background:#151b21;border:1px solid #232c34;border-radius:12px;padding:18px 20px;overflow-x:auto;font:13.5px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;color:#e8edf2;margin:0 0 28px}
+.k{color:#3ad0c4}.c{color:#5c6773}
+h2{font-size:14px;text-transform:uppercase;letter-spacing:.14em;color:#8b97a4;margin:44px 0 14px}
+.grid{display:grid;gap:14px}
+@media(min-width:600px){.grid{grid-template-columns:1fr 1fr}}
+.card{background:#151b21;border:1px solid #232c34;border-radius:12px;padding:18px 20px}
+.card h3{margin:0 0 6px;font-size:16px;color:#e8edf2}
+.card p{margin:0;color:#8b97a4;font-size:14.5px}
+table{width:100%;border-collapse:collapse;font-size:14.5px;margin:0 0 8px}
+th{text-align:left;color:#5c6773;font:11px ui-monospace,monospace;text-transform:uppercase;letter-spacing:.1em;border-bottom:1px solid #232c34;padding:9px 8px}
+td{padding:10px 8px;border-bottom:1px solid #1b232a;color:#b4bcc8}
+td code{color:#3ad0c4;font:13px ui-monospace,monospace}
+.foot{margin-top:56px;padding-top:20px;border-top:1px solid #232c34;color:#5c6773;font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <p class="eyebrow">machin-feedback</p>
+  <h1>One inbox for every app's <span class="g">feedback</span> command.</h1>
+  <p class="lede">Terminal agents are the users of your CLIs, and they hit friction that evaporates silently. machin-feedback gives them a channel &mdash; and gives you one cross-app inbox instead of eight per-app silos. A single static <a href="https://github.com/javimosch/machin">machin</a> binary: the daemon <em>and</em> the CLI.</p>
+
+  <div class="cta">
+    <a class="btn primary" href="https://github.com/javimosch/machin-feedback">View on GitHub</a>
+    <a class="btn ghost" href="https://feedback.intrane.fr">Live instance &rarr;</a>
+  </div>
+
+  <pre><span class="c"># any tool's feedback command posts here — open, no creds:</span>
+curl -X POST https://feedback.example.com/v1/feedback \
+  -d '{<span class="k">"app"</span>:"hart",<span class="k">"kind"</span>:"bug",<span class="k">"message"</span>:"publish 422 on a valid page",<span class="k">"id"</span>:"..."}'
+<span class="c">{"ok":true,"id":"...","stored":true}</span></pre>
+
+  <h2>Why it's small</h2>
+  <div class="grid">
+    <div class="card"><h3>Capture + browse, not a support desk</h3><p>No threads, replies, or status workflow. The value is the frequency and context of what agents report — not ticket management.</p></div>
+    <div class="card"><h3>Open to submit, gated to read</h3><p>Agents have no credentials, so posting takes no auth (rate-limited + size-capped). Reading and the dashboard need an admin token.</p></div>
+    <div class="card"><h3>Idempotent on a client id</h3><p>A feedback command that dual-writes — to its own app and here — sends the same id to both. Retries and dupes collapse to one row.</p></div>
+    <div class="card"><h3>One file, one binary</h3><p>SQLite store, no index to corrupt, nothing to install at runtime. Vendors machweb; builds with a single <code>machin build</code>.</p></div>
+  </div>
+
+  <h2>API</h2>
+  <table>
+    <tr><th>verb</th><th>route</th><th>auth</th></tr>
+    <tr><td>POST</td><td><code>/v1/feedback</code></td><td>open (rate-limited)</td></tr>
+    <tr><td>GET</td><td><code>/v1/feedback?app=&amp;limit=</code></td><td>Bearer admin token</td></tr>
+    <tr><td>GET</td><td><code>/</code></td><td>admin cookie (dashboard)</td></tr>
+    <tr><td>GET</td><td><code>/_health</code></td><td>open</td></tr>
+  </table>
+
+  <h2>The feedback-command contract</h2>
+  <p style="color:#8b97a4;font-size:14.5px;margin:0 0 8px">Any CLI adds a <code style="color:#3ad0c4;font:13px ui-monospace,monospace">feedback</code> command that <strong style="color:#e8edf2">dual-writes, best-effort</strong>: POST to its own daemon and, independently, POST here. Short timeouts; neither failure should ever break the agent's flow. A shared client-generated id makes it idempotent. First adopter: <a href="https://github.com/javimosch/machin-hart">hart</a>.</p>
+
+  <div class="foot">
+    Built in <a href="https://github.com/javimosch/machin">machin</a> (MFL) · part of the agent-first stack by <a href="https://intrane.fr">Intrane</a> · MIT.
+  </div>
+</div>
+</body>
+</html>
