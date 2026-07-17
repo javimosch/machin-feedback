@@ -1,0 +1,279 @@
+// machin-feedback — a tiny agent-first feedback relay. One static MFL binary that is both the
+// daemon (`machin-feedback serve`) and CLI. Any tool's `feedback` command POSTs here; operators
+// browse it all in one place, across every app.
+//
+// Design: capture + browse, not a support desk. Submitting is OPEN (agents have no creds) but
+// rate-limited + size-capped; reading is admin-gated. Storage is a single SQLite file; a
+// client-supplied id makes writes idempotent (safe for the dual-write from a feedback command).
+//
+// Env: FEEDBACK_DB (~/.machin-feedback.db) · FEEDBACK_ADMIN_TOKEN (gates reads/dashboard) ·
+//      FEEDBACK_PUBLIC (canonical base) · FEEDBACK_MAX_PER_MIN (30) · FEEDBACK_MAX_BYTES (16384) ·
+//      FEEDBACK_COOKIE_SECRET · FEEDBACK_PORT (3900)
+
+type Fb struct { id string  app string  version string  kind string  message string  context string  reporter string  created int  ip string }
+type FbRow struct { id string  app string  version string  kind string  message string  context string  reporter string  created int }
+type AppRow struct { app string  cnt int  last int }
+type CntRow struct { n int }
+
+func say(s) { write(1, s + "\n") }
+func die(code, msg) { write(2, "{\"ok\":false,\"error\":" + json(msg) + "}\n")  exit(code) }
+
+func fdb() (p) {
+    p = env("FEEDBACK_DB")
+    if p == "" { p = env("HOME") + "/.machin-feedback.db" }
+}
+
+func opendb() (db) {
+    db = sqlite_open(fdb())
+    sqlite_exec(db, "PRAGMA busy_timeout=3000", []string{})
+    sqlite_exec(db, "CREATE TABLE IF NOT EXISTS feedback(id TEXT PRIMARY KEY, app TEXT DEFAULT '', version TEXT DEFAULT '', kind TEXT DEFAULT '', message TEXT, context TEXT DEFAULT '', reporter TEXT DEFAULT '', created INTEGER, ip TEXT DEFAULT '')", []string{})
+    sqlite_exec(db, "CREATE TABLE IF NOT EXISTS hits(ip TEXT, ts INTEGER)", []string{})
+}
+
+func nid() (s) { s = to_hex(rand_bytes(8)) }
+func maxbytes() (n) { n = parse_int(env("FEEDBACK_MAX_BYTES"))  if n <= 0 { n = 16384 } }
+func maxpermin() (n) { n = parse_int(env("FEEDBACK_MAX_PER_MIN"))  if n <= 0 { n = 30 } }
+
+func fb_client_ip(req) (ip) {
+    ip = header(req, "x-forwarded-for")
+    ci := index(ip, ",")
+    if ci >= 0 { ip = trim(substr(ip, 0, ci)) }
+    if ip == "" { ip = header(req, "x-real-ip") }
+    if ip == "" { ip = "unknown" }
+}
+
+// rate_ok — sliding 60s per-IP window on submissions.
+func rate_ok(db, ip) (ok) {
+    cut := now() - 60
+    sqlite_exec(db, "DELETE FROM hits WHERE ts < ?", []string{str(cut)})
+    crows := sqlite_query(db, "SELECT COUNT(*) AS n FROM hits WHERE ip = ? AND ts >= ?", []string{ip, str(cut)})
+    cs := parse(crows, []CntRow{})
+    if len(cs) > 0 { if cs[0].n >= maxpermin() { return 0 } }
+    sqlite_exec(db, "INSERT INTO hits(ip, ts) VALUES(?,?)", []string{ip, str(now())})
+    ok = 1
+}
+
+var g_cookie_secret = ""
+func cookie_secret() (s) { s = g_cookie_secret }
+
+func admin_token() (t) { t = env("FEEDBACK_ADMIN_TOKEN") }
+
+// check_admin — Bearer must equal FEEDBACK_ADMIN_TOKEN. Unset = reads OFF (403), never open.
+func check_admin(req) (ok) {
+    at := admin_token()
+    if at == "" { return 0 }
+    if header(req, "authorization") == "Bearer " + at { return 1 }
+    ok = 0
+}
+
+func pubbase(req) (b) {
+    b = env("FEEDBACK_PUBLIC")
+    if b == "" {
+        host := header(req, "host")
+        if host == "" { host = "127.0.0.1:3900" }
+        b = "http://" + host
+    }
+}
+
+func esc(s) (o) {
+    o = replace(s, "&", "&amp;")
+    o = replace(o, "<", "&lt;")
+    o = replace(o, ">", "&gt;")
+    o = replace(o, "\"", "&quot;")
+}
+
+func clamp(s, n) (o) {
+    o = s
+    if len(s) > n { o = substr(s, 0, n) }
+}
+
+// ---- API -------------------------------------------------------------------
+
+// POST /v1/feedback — open submission. Body = JSON {app,version,kind,message,context,id,reporter}.
+// message required. Idempotent on client id (INSERT OR IGNORE). Rate-limited + size-capped.
+func h_submit(req) (res) {
+    body := req.body
+    if len(body) > maxbytes() { return response("413 Payload Too Large", "application/json", "{\"ok\":false,\"error\":\"feedback too large (max " + str(maxbytes()) + " bytes)\"}") }
+    fs := parse("[" + body + "]", []Fb{})
+    if len(fs) == 0 { return response("400 Bad Request", "application/json", "{\"ok\":false,\"error\":\"invalid JSON body\"}") }
+    f := fs[0]
+    if trim(f.message) == "" { return response("400 Bad Request", "application/json", "{\"ok\":false,\"error\":\"message is required\"}") }
+    db := opendb()
+    ip := fb_client_ip(req)
+    if rate_ok(db, ip) == 0 { sqlite_close(db); return response("429 Too Many Requests", "application/json", "{\"ok\":false,\"error\":\"rate limit — slow down\"}") }
+    id := f.id
+    if id == "" { id = nid() }
+    sqlite_exec(db, "INSERT OR IGNORE INTO feedback(id, app, version, kind, message, context, reporter, created, ip) VALUES(?,?,?,?,?,?,?,?,?)", []string{id, clamp(f.app, 64), clamp(f.version, 32), clamp(f.kind, 24), clamp(f.message, maxbytes()), clamp(f.context, maxbytes()), clamp(f.reporter, 64), str(now()), ip})
+    sqlite_close(db)
+    res = ok_json("{\"ok\":true,\"id\":\"" + esc(id) + "\",\"stored\":true}")
+}
+
+// GET /v1/feedback?app=&limit=  — admin-gated JSON list, newest first.
+func h_list(req) (res) {
+    if check_admin(req) == 0 { return response("403 Forbidden", "application/json", "{\"ok\":false,\"error\":\"admin token required — set FEEDBACK_ADMIN_TOKEN and send it as Bearer\"}") }
+    db := opendb()
+    app := query(req, "app")
+    lim := parse_int(query(req, "limit"))
+    if lim <= 0 { lim = 200 }
+    rows := ""
+    if app != "" {
+        rows = sqlite_query(db, "SELECT id, app, version, kind, message, context, reporter, created FROM feedback WHERE app = ? ORDER BY created DESC LIMIT ?", []string{app, str(lim)})
+    } else {
+        rows = sqlite_query(db, "SELECT id, app, version, kind, message, context, reporter, created FROM feedback ORDER BY created DESC LIMIT ?", []string{str(lim)})
+    }
+    sqlite_close(db)
+    res = ok_json("{\"ok\":true,\"feedback\":" + rows + "}")
+}
+
+// ---- dashboard (admin cookie) ----------------------------------------------
+
+func admin_authed(req) (ok) {
+    at := admin_token()
+    if at == "" { return 0 }
+    v, vok := get_session(req, cookie_secret(), "mf_admin")
+    if vok == 1 { if v == to_hex(sha256_bytes(bytes(at))) { return 1 } }
+    ok = 0
+}
+
+func page(inner) (h) {
+    st := "body{margin:0;background:#0e1216;color:#e8edf2;font:15px/1.6 system-ui,sans-serif}.w{max-width:820px;margin:0 auto;padding:44px 24px 72px}h1{font-size:24px;letter-spacing:-.02em;margin:0 0 4px}.eyebrow{font:12px ui-monospace,monospace;letter-spacing:.18em;text-transform:uppercase;color:#3ad0c4;margin:0 0 18px}.card{background:#151b21;border:1px solid #232c34;border-radius:12px;padding:16px 18px;margin:0 0 12px}.tag{display:inline-block;font:11px ui-monospace,monospace;text-transform:uppercase;letter-spacing:.08em;padding:1px 7px;border-radius:999px;background:#1b232a;color:#8b97a4;margin-right:8px}.app{color:#3ad0c4}.meta{color:#5c6773;font:12px ui-monospace,monospace;margin-top:8px}.msg{white-space:pre-wrap;color:#e8edf2}.ctx{white-space:pre-wrap;color:#8b97a4;font:12px ui-monospace,monospace;margin-top:8px;border-top:1px solid #232c34;padding-top:8px}form{display:flex;gap:8px;max-width:360px}input{flex:1;background:#151b21;border:1px solid #232c34;border-radius:8px;padding:11px 13px;color:#e8edf2;font:14px system-ui}button{background:#3ad0c4;color:#062023;border:0;border-radius:8px;padding:11px 18px;font:600 14px system-ui;cursor:pointer}.empty{color:#5c6773}a{color:#3ad0c4;text-decoration:none}"
+    h = "<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>machin-feedback</title><style>" + st + "</style></head><body><div class=\"w\">" + inner + "</div></body></html>"
+}
+
+func login_page(errmsg) (res) {
+    em := ""
+    if errmsg != "" { em = "<p class=\"meta\" style=\"color:#e0a355\">" + esc(errmsg) + "</p>" }
+    inner := "<p class=\"eyebrow\">machin-feedback</p><h1>Operator sign-in</h1><p class=\"meta\">Enter FEEDBACK_ADMIN_TOKEN to browse feedback.</p><form method=\"POST\" action=\"/_login\"><input type=\"password\" name=\"token\" placeholder=\"admin token\" autofocus><button type=\"submit\">View</button></form>" + em
+    r := response("401 Unauthorized", "text/html; charset=utf-8", page(inner))
+    r = with_header(r, "Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'")
+    r = with_header(r, "X-Frame-Options", "DENY")
+    r = with_header(r, "Cache-Control", "no-store")
+    res = r
+}
+
+func h_login(req) (res) {
+    at := admin_token()
+    if at == "" { return response("404 Not Found", "text/plain", "dashboard disabled (set FEEDBACK_ADMIN_TOKEN)") }
+    if query_form(req, "token") != at { return login_page("Wrong token.") }
+    r := redirect("/")
+    r = set_session(r, cookie_secret(), "mf_admin", to_hex(sha256_bytes(bytes(at))))
+    res = r
+}
+func h_logout(req) (res) {
+    r := redirect("/")
+    r = set_session(r, cookie_secret(), "mf_admin", "")
+    res = r
+}
+
+func query_form(req, name) (v) {
+    v = ""
+    parts := split(req.body, "&")
+    i := 0
+    for i < len(parts) {
+        kv := split(parts[i], "=")
+        if len(kv) >= 2 { if url_decode(kv[0]) == name { v = url_decode(kv[1]) } }
+        i = i + 1
+    }
+}
+
+func kind_tag(k) (t) {
+    kk := k
+    if kk == "" { kk = "note" }
+    t = "<span class=\"tag\">" + esc(kk) + "</span>"
+}
+
+func serve_dashboard(req) (res) {
+    if admin_token() == "" { return response("404 Not Found", "text/plain", "dashboard disabled (set FEEDBACK_ADMIN_TOKEN)") }
+    if admin_authed(req) == 0 { return login_page("") }
+    db := opendb()
+    total := 0
+    crows := sqlite_query(db, "SELECT COUNT(*) AS n FROM feedback", []string{})
+    cs := parse(crows, []CntRow{})
+    if len(cs) > 0 { total = cs[0].n }
+    approws := sqlite_query(db, "SELECT app AS app, COUNT(*) AS cnt, MAX(created) AS last FROM feedback GROUP BY app ORDER BY cnt DESC", []string{})
+    apps := parse(approws, []AppRow{})
+    app := query(req, "app")
+    rows := ""
+    if app != "" {
+        rows = sqlite_query(db, "SELECT id, app, version, kind, message, context, reporter, created FROM feedback WHERE app = ? ORDER BY created DESC LIMIT 100", []string{app})
+    } else {
+        rows = sqlite_query(db, "SELECT id, app, version, kind, message, context, reporter, created FROM feedback ORDER BY created DESC LIMIT 100", []string{})
+    }
+    items := parse(rows, []FbRow{})
+    sqlite_close(db)
+
+    h := "<div style=\"display:flex;justify-content:space-between;align-items:baseline\"><p class=\"eyebrow\">machin-feedback</p><a href=\"/_logout\" class=\"meta\">sign out</a></div>"
+    h = h + "<h1>Feedback</h1><p class=\"meta\">" + str(total) + " total across " + str(len(apps)) + " apps.</p>"
+    // app filter chips
+    h = h + "<p style=\"margin:14px 0\"><a class=\"tag\" href=\"/\">all</a> "
+    i := 0
+    for i < len(apps) {
+        a := apps[i]
+        an := a.app
+        if an == "" { an = "(none)" }
+        h = h + "<a class=\"tag\" href=\"/?app=" + esc(a.app) + "\"><span class=\"app\">" + esc(an) + "</span> " + str(a.cnt) + "</a> "
+        i = i + 1
+    }
+    h = h + "</p>"
+    if len(items) == 0 {
+        h = h + "<p class=\"empty\">No feedback yet. Point a tool's <code>feedback</code> command here.</p>"
+    }
+    j := 0
+    for j < len(items) {
+        it := items[j]
+        card := "<div class=\"card\">" + kind_tag(it.kind) + "<span class=\"app\">" + esc(it.app) + "</span>"
+        if it.version != "" { card = card + " <span class=\"meta\" style=\"display:inline\">v" + esc(it.version) + "</span>" }
+        card = card + "<div class=\"msg\" style=\"margin-top:8px\">" + esc(it.message) + "</div>"
+        if it.context != "" { card = card + "<div class=\"ctx\">" + esc(it.context) + "</div>" }
+        rep := it.reporter
+        if rep == "" { rep = "anon" }
+        card = card + "<div class=\"meta\">" + esc(rep) + " · " + time_format(it.created, "%Y-%m-%d %H:%M") + "</div></div>"
+        h = h + card
+        j = j + 1
+    }
+    r := ok_html(page(h))
+    r = with_header(r, "Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'")
+    r = with_header(r, "X-Frame-Options", "DENY")
+    r = with_header(r, "Cache-Control", "no-store")
+    res = r
+}
+
+// ---- routing + serve -------------------------------------------------------
+
+func fb_route(req) (res) {
+    p := req.path
+    qi := index(p, "?")
+    if qi >= 0 { p = substr(p, 0, qi) }
+    if p == "/_health" { return ok_json("{\"ok\":true,\"service\":\"machin-feedback\"}") }
+    if req.method == "POST" && p == "/v1/feedback" { return h_submit(req) }
+    if req.method == "GET" && p == "/v1/feedback" { return h_list(req) }
+    if req.method == "POST" && p == "/_login" { return h_login(req) }
+    if req.method == "GET" && p == "/_logout" { return h_logout(req) }
+    if req.method == "GET" && (p == "/" || p == "/dashboard") { return serve_dashboard(req) }
+    res = response("404 Not Found", "text/plain; charset=utf-8", "not found")
+}
+
+func cmd_serve(a) {
+    port := 3900
+    if env("FEEDBACK_PORT") != "" { port = parse_int(env("FEEDBACK_PORT")) }
+    if len(a) >= 3 { port = parse_int(a[2]) }
+    g_cookie_secret = env("FEEDBACK_COOKIE_SECRET")
+    if g_cookie_secret == "" { g_cookie_secret = to_hex(rand_bytes(24)) }
+    if has_prefix(env("FEEDBACK_PUBLIC"), "https://") { set_secure_cookies(1) }
+    say("{\"ok\":true,\"serving\":\"machin-feedback\",\"port\":" + str(port) + ",\"routes\":[\"POST /v1/feedback\",\"GET /v1/feedback (admin)\",\"GET / (dashboard)\"]}")
+    serve(port, func(req) { return fb_route(req) })
+}
+
+func cmd_help() {
+    say("{\"ok\":true,\"name\":\"machin-feedback\",\"tagline\":\"agent-first feedback relay — one inbox for every app's feedback command\",\"commands\":{\"serve\":\"serve [port] (daemon; FEEDBACK_DB, FEEDBACK_ADMIN_TOKEN gates reads, FEEDBACK_PUBLIC)\",\"help\":\"this\"},\"api\":{\"submit\":\"POST /v1/feedback  {app,version,kind,message,context,id,reporter}  (open, rate-limited, idempotent on id)\",\"list\":\"GET /v1/feedback?app=&limit=  (Bearer FEEDBACK_ADMIN_TOKEN)\",\"dashboard\":\"GET /  (admin cookie)\"}}")
+}
+
+func main() {
+    a := args()
+    cmd := ""
+    if len(a) >= 2 { cmd = a[1] }
+    if cmd == "" || cmd == "help" || cmd == "help-json" { cmd_help()  return }
+    if cmd == "serve" { cmd_serve(a)  return }
+    write(2, "{\"ok\":false,\"error\":\"unknown command: " + cmd + " (serve|help)\"}\n")
+    exit(80)
+}
