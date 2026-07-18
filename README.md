@@ -87,7 +87,7 @@ flow. A client-generated `id` shared across both writes makes it idempotent.
 
 This is the **reference relay** for that convention. The convention itself — the normative
 contract, the JSON Schema, and a copy-paste recipe for adding a `feedback` command in any
-language — is written up as **[feedback-spec](https://github.com/javimosch/feedback-spec)**.
+language — is written up as **[cli-feedback-spec](https://github.com/javimosch/cli-feedback-spec)**.
 Adopters: hart, grepapi, crmd, remotecmd (rcmd), portier, machin-idp, chatsnip.
 
 ## Build
