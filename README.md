@@ -83,8 +83,12 @@ landed where.
 
 Any CLI adds a `feedback` command that **dual-writes, best-effort**: POST to its *own* daemon and,
 independently, POST here. Both with short timeouts; neither failure should ever break the agent's
-flow. A client-generated `id` shared across both writes makes it idempotent. First adopter:
-[hart](https://github.com/javimosch/machin-hart) (`hart feedback`).
+flow. A client-generated `id` shared across both writes makes it idempotent.
+
+This is the **reference relay** for that convention. The convention itself — the normative
+contract, the JSON Schema, and a copy-paste recipe for adding a `feedback` command in any
+language — is written up as **[feedback-spec](https://github.com/javimosch/feedback-spec)**.
+Adopters: hart, grepapi, crmd, remotecmd (rcmd), portier, machin-idp, chatsnip.
 
 ## Build
 
